@@ -1,0 +1,17 @@
+# Datos crudos (~760MB, se re-descargan solos con pipeline/load_and_clean.py)
+data/sackmann_mirror/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node / frontend (Etapa 3)
+node_modules/
+dist/
+.expo/
+
+# Entorno
+.env
+.env.local

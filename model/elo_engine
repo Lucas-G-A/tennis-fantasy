@@ -1,0 +1,241 @@
+"""
+elo_engine.py
+Etapa 1 · Actividad 3: Motor de calificación Elo/Glicko-2
+
+Mantiene, por jugador, un rating GENERAL y un rating por SUPERFICIE (Hard/Clay/Grass;
+Carpet se acumula solo en el general por su bajo volumen post-2009). El rating usado
+para predecir un partido es una mezcla ponderada por experiencia en esa superficie:
+
+    rating_prediccion = w * rating_superficie + (1-w) * rating_general
+    w = n_partidos_en_superficie / (n_partidos_en_superficie + C)
+
+El tamaño de cada actualización se pondera por:
+  - nivel del torneo (Slam > Masters/Premier > tour regular)
+  - retiro (peso 0.5) — walkover se descarta por completo (no actualiza nada)
+  - margen de victoria (multiplicador chico, +/-15% como máximo)
+
+Al cierre de cada temporada, el rating regresa 20% hacia el promedio de carrera —
+excepto cuando eso contradice la trayectoria esperada por edad (ver `should_regress`).
+
+Salida:
+  model/ratings_output/{tour}_final_ratings.csv     — snapshot final por jugador
+  model/ratings_output/{tour}_predictions.parquet    — predicción pre-partido de cada
+                                                        partido histórico (insumo para
+                                                        el backtesting de la Etapa 1.4)
+"""
+
+from pathlib import Path
+from collections import defaultdict
+
+import pandas as pd
+
+from glicko2 import RatingState, update_rating_period, win_probability, DEFAULT_RATING
+from score_parser import parse_score, margin_multiplier
+
+DATA_DIR = Path(__file__).parent.parent / "data" / "processed"
+OUT_DIR = Path(__file__).parent / "ratings_output"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+SURFACE_POOLS = ["Hard", "Clay", "Grass"]   # Carpet: se ignora como pool propio (poco volumen)
+SURFACE_BLEND_C = 15                          # partidos en superficie para confiar mitad/mitad
+
+RETIREMENT_WEIGHT = 0.5
+MARGIN_WEIGHT_RANGE = 0.3
+WEIGHT_CLAMP = (0.1, 2.0)
+
+REGRESSION_FACTOR = 0.20     # 20% hacia el promedio de carrera
+AGE_DECLINE = 32              # a partir de esta edad, no empujar el rating hacia arriba
+AGE_DEVELOPMENT = 23           # antes de esta edad, no empujar el rating hacia abajo
+
+TOURNEY_LEVEL_WEIGHTS = {
+    "atp": {"G": 1.00, "F": 0.90, "M": 0.85, "O": 0.85, "A": 0.65, "C": 0.50},
+    "wta": {"G": 1.00, "F": 0.90, "PM": 0.85, "O": 0.85, "P": 0.75,
+            "T1": 0.75, "T2": 0.70, "I": 0.65, "W": 0.65, "T3": 0.65,
+            "T4": 0.60, "T5": 0.55, "CC": 0.60},
+}
+DEFAULT_LEVEL_WEIGHT = 0.6
+
+REFERENCE_DATE = pd.Timestamp("1990-01-01")
+
+
+def week_index(date: pd.Timestamp) -> int:
+    return (date - REFERENCE_DATE).days // 7
+
+
+class PlayerPools:
+    """Todos los pools de rating (general + superficies) de un jugador."""
+
+    def __init__(self):
+        self.general = RatingState()
+        self.surface = {s: RatingState() for s in SURFACE_POOLS}
+        self.last_played_week = {"general": None, **{s: None for s in SURFACE_POOLS}}
+        self.career_ratings = {"general": [], **{s: [] for s in SURFACE_POOLS}}
+        self.last_known_age = None
+
+    def pool(self, key: str) -> RatingState:
+        return self.general if key == "general" else self.surface[key]
+
+    def blended_rating(self, surface: str) -> RatingState:
+        """Rating a usar para PREDICCIÓN: mezcla superficie + general por experiencia."""
+        surf_state = self.surface.get(surface)
+        if surf_state is None or surf_state.n_matches == 0:
+            return self.general
+        w = surf_state.n_matches / (surf_state.n_matches + SURFACE_BLEND_C)
+        blended = RatingState(
+            rating=w * surf_state.rating + (1 - w) * self.general.rating,
+            rd=w * surf_state.rd + (1 - w) * self.general.rd,
+        )
+        return blended
+
+
+def should_regress(age, current_rating, career_avg) -> bool:
+    if age is None:
+        return True
+    if age >= AGE_DECLINE and current_rating < career_avg:
+        return False   # el declive es real, no lo empujamos hacia arriba
+    if age <= AGE_DEVELOPMENT and current_rating > career_avg:
+        return False   # la mejora es real, no lo empujamos hacia abajo
+    return True
+
+
+def apply_season_regression(players: dict):
+    for p in players.values():
+        for key in ["general", *SURFACE_POOLS]:
+            state = p.pool(key)
+            if state.n_matches == 0:
+                continue
+            p.career_ratings[key].append(state.rating)
+            career_avg = sum(p.career_ratings[key]) / len(p.career_ratings[key])
+            if should_regress(p.last_known_age, state.rating, career_avg):
+                state.rating = (1 - REGRESSION_FACTOR) * state.rating + REGRESSION_FACTOR * career_avg
+
+
+def compute_weight(tour: str, tourney_level: str, is_retirement: bool,
+                    games_w, games_l, is_valid_score: bool) -> float:
+    level_w = TOURNEY_LEVEL_WEIGHTS.get(tour, {}).get(tourney_level, DEFAULT_LEVEL_WEIGHT)
+    ret_w = RETIREMENT_WEIGHT if is_retirement else 1.0
+    margin_w = 1.0
+    if is_valid_score and not is_retirement:
+        margin_w = margin_multiplier(games_w, games_l, MARGIN_WEIGHT_RANGE)
+    weight = level_w * ret_w * margin_w
+    return min(max(weight, WEIGHT_CLAMP[0]), WEIGHT_CLAMP[1])
+
+
+def run_engine(tour: str, matches: pd.DataFrame):
+    matches = matches.copy()
+    matches["week_idx"] = matches["tourney_date"].apply(week_index)
+    matches["year"] = matches["tourney_date"].dt.year
+    matches = matches[~matches["is_walkover"]].copy()   # walkover: no actualiza nada
+    # Copa Davis / Fed Cup (BJK Cup): formato por equipos, con grupos zonales de calidad
+    # muy dispareja y muchos rivales sin ranking registrado. Se excluye del rating —
+    # mismo criterio que usan otros sistemas de Elo de tenis (ej. FiveThirtyEight).
+    matches = matches[matches["tourney_level"] != "D"].copy()
+
+    games_parsed = matches["score"].apply(parse_score)
+    matches["games_w"] = games_parsed.apply(lambda t: t[0])
+    matches["games_l"] = games_parsed.apply(lambda t: t[1])
+    matches["score_valid"] = games_parsed.apply(lambda t: t[2])
+
+    players = defaultdict(PlayerPools)
+    predictions = []
+
+    current_year = matches["year"].iloc[0]
+
+    for week, week_df in matches.groupby("week_idx", sort=True):
+        # cierre de temporada: si esta semana ya es de un año distinto, regresa antes de seguir
+        week_year = week_df["year"].iloc[0]
+        if week_year != current_year:
+            apply_season_regression(players)
+            current_year = week_year
+
+        # --- Paso 1: snapshot de los ratings pre-semana + registrar predicciones ---
+        involved_ids = set(week_df["winner_id"]) | set(week_df["loser_id"])
+        pre_general = {}
+        pre_surface = {}
+        for pid in involved_ids:
+            p = players[pid]
+            gap = 0 if p.last_played_week["general"] is None else max(0, week - p.last_played_week["general"] - 1)
+            p.general.periods_since_active = gap
+            p.general.apply_inactivity()
+            pre_general[pid] = RatingState(p.general.rating, p.general.rd, p.general.vol, p.general.n_matches)
+            for s in SURFACE_POOLS:
+                gap_s = 0 if p.last_played_week[s] is None else max(0, week - p.last_played_week[s] - 1)
+                p.surface[s].periods_since_active = gap_s
+                p.surface[s].apply_inactivity()
+            pre_surface[pid] = {s: RatingState(p.surface[s].rating, p.surface[s].rd,
+                                                p.surface[s].vol, p.surface[s].n_matches)
+                                 for s in SURFACE_POOLS}
+
+        for row in week_df.itertuples():
+            w_blend = players[row.winner_id].blended_rating(row.surface) if row.surface in SURFACE_POOLS \
+                else pre_general[row.winner_id]
+            l_blend = players[row.loser_id].blended_rating(row.surface) if row.surface in SURFACE_POOLS \
+                else pre_general[row.loser_id]
+            prob_winner = win_probability(pre_general[row.winner_id], pre_general[row.loser_id]) \
+                if row.surface not in SURFACE_POOLS else win_probability(w_blend, l_blend)
+            predictions.append({
+                "tourney_date": row.tourney_date, "tour": tour, "surface": row.surface,
+                "tourney_level": row.tourney_level, "round": row.round,
+                "winner_id": row.winner_id, "loser_id": row.loser_id,
+                "winner_rank": row.winner_rank, "loser_rank": row.loser_rank,
+                "prob_winner": prob_winner,
+            })
+            # edad conocida más reciente
+            players[row.winner_id].last_known_age = row.winner_age
+            players[row.loser_id].last_known_age = row.loser_age
+
+        # --- Paso 2: construir juegos por jugador y actualizar, pool por pool ---
+        for pool_key in ["general", *SURFACE_POOLS]:
+            games_by_player = defaultdict(list)
+            for row in week_df.itertuples():
+                if pool_key != "general" and row.surface != pool_key:
+                    continue
+                weight = compute_weight(tour, row.tourney_level, row.is_retirement,
+                                         row.games_w, row.games_l, row.score_valid)
+                opp_for_winner = pre_general[row.loser_id] if pool_key == "general" else pre_surface[row.loser_id][pool_key]
+                opp_for_loser = pre_general[row.winner_id] if pool_key == "general" else pre_surface[row.winner_id][pool_key]
+                games_by_player[row.winner_id].append({"opponent": opp_for_winner, "score": 1.0, "weight": weight})
+                games_by_player[row.loser_id].append({"opponent": opp_for_loser, "score": 0.0, "weight": weight})
+
+            for pid, games in games_by_player.items():
+                state = players[pid].pool(pool_key)
+                state.periods_since_active = 0  # ya se aplicó arriba antes del snapshot
+                update_rating_period(state, games)
+                players[pid].last_played_week[pool_key] = week
+
+    apply_season_regression(players)  # cierre de la última temporada de datos
+    return players, pd.DataFrame(predictions)
+
+
+def save_outputs(tour: str, players: dict, predictions: pd.DataFrame, player_names: pd.DataFrame):
+    rows = []
+    for pid, p in players.items():
+        row = {"player_id": pid, "general_rating": round(p.general.rating, 1),
+               "general_rd": round(p.general.rd, 1), "general_n": p.general.n_matches}
+        for s in SURFACE_POOLS:
+            row[f"{s.lower()}_rating"] = round(p.surface[s].rating, 1)
+            row[f"{s.lower()}_rd"] = round(p.surface[s].rd, 1)
+            row[f"{s.lower()}_n"] = p.surface[s].n_matches
+        rows.append(row)
+    ratings_df = pd.DataFrame(rows)
+
+    name_col = "player_id" if "player_id" in player_names.columns else player_names.columns[0]
+    ratings_df = ratings_df.merge(player_names, left_on="player_id", right_on=name_col, how="left")
+
+    ratings_df.sort_values("general_rating", ascending=False).to_csv(
+        OUT_DIR / f"{tour}_final_ratings.csv", index=False)
+    predictions.to_parquet(OUT_DIR / f"{tour}_predictions.parquet", index=False)
+
+
+if __name__ == "__main__":
+    for tour in ["atp", "wta"]:
+        print(f"Procesando {tour.upper()}...")
+        matches = pd.read_parquet(DATA_DIR / f"{tour}_matches_clean.parquet")
+        players_meta = pd.read_parquet(DATA_DIR / f"{tour}_players.parquet")
+        players_meta["full_name"] = players_meta["name_first"] + " " + players_meta["name_last"]
+
+        players, predictions = run_engine(tour, matches)
+        save_outputs(tour, players, predictions, players_meta[["player_id", "full_name"]])
+        print(f"  {len(players):,} jugadores, {len(predictions):,} predicciones guardadas.")
+
+    print(f"\nListo. Resultados en: {OUT_DIR}")

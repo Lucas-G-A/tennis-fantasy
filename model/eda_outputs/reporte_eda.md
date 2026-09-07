@@ -16,15 +16,15 @@ Etapa 1 · Actividad 2 — datos ATP/WTA, 1990–2026
 - Superficie con más upsets: Carpet (35.9%). Con menos: Hard (34.2%).
 
 
-![matches by surface](eda_outputs/atp_matches_by_surface_year.png)
+![matches by surface](atp_matches_by_surface_year.png)
 
-![winrate vs rankgap](eda_outputs/atp_winrate_vs_rankgap.png)
+![winrate vs rankgap](atp_winrate_vs_rankgap.png)
 
-![upset by round](eda_outputs/atp_upset_by_round.png)
+![upset by round](atp_upset_by_round.png)
 
-![upset by surface](eda_outputs/atp_upset_by_surface.png)
+![upset by surface](atp_upset_by_surface.png)
 
-![upset over time](eda_outputs/atp_upset_over_time.png)
+![upset over time](atp_upset_over_time.png)
 
 
 ## WTA
@@ -40,15 +40,15 @@ Etapa 1 · Actividad 2 — datos ATP/WTA, 1990–2026
 - Superficie con más upsets: Grass (34.2%). Con menos: Carpet (30.4%).
 
 
-![matches by surface](eda_outputs/wta_matches_by_surface_year.png)
+![matches by surface](wta_matches_by_surface_year.png)
 
-![winrate vs rankgap](eda_outputs/wta_winrate_vs_rankgap.png)
+![winrate vs rankgap](wta_winrate_vs_rankgap.png)
 
-![upset by round](eda_outputs/wta_upset_by_round.png)
+![upset by round](wta_upset_by_round.png)
 
-![upset by surface](eda_outputs/wta_upset_by_surface.png)
+![upset by surface](wta_upset_by_surface.png)
 
-![upset over time](eda_outputs/wta_upset_over_time.png)
+![upset over time](wta_upset_over_time.png)
 
 
 ## Implicaciones para el modelo Elo/Glicko-2

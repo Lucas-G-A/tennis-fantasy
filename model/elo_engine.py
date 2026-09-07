@@ -37,7 +37,7 @@ OUT_DIR = Path(__file__).parent / "ratings_output"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 SURFACE_POOLS = ["Hard", "Clay", "Grass"]   # Carpet: se ignora como pool propio (poco volumen)
-SURFACE_BLEND_C = 15                          # partidos en superficie para confiar mitad/mitad
+SURFACE_BLEND_C = 150                          # partidos en superficie para confiar mitad/mitad
 
 RETIREMENT_WEIGHT = 0.5
 MARGIN_WEIGHT_RANGE = 0.3
@@ -167,18 +167,20 @@ def run_engine(tour: str, matches: pd.DataFrame):
                                  for s in SURFACE_POOLS}
 
         for row in week_df.itertuples():
-            w_blend = players[row.winner_id].blended_rating(row.surface) if row.surface in SURFACE_POOLS \
-                else pre_general[row.winner_id]
-            l_blend = players[row.loser_id].blended_rating(row.surface) if row.surface in SURFACE_POOLS \
-                else pre_general[row.loser_id]
-            prob_winner = win_probability(pre_general[row.winner_id], pre_general[row.loser_id]) \
-                if row.surface not in SURFACE_POOLS else win_probability(w_blend, l_blend)
+            prob_general_only = win_probability(pre_general[row.winner_id], pre_general[row.loser_id])
+            if row.surface in SURFACE_POOLS:
+                w_blend = players[row.winner_id].blended_rating(row.surface)
+                l_blend = players[row.loser_id].blended_rating(row.surface)
+                prob_winner = win_probability(w_blend, l_blend)
+            else:
+                prob_winner = prob_general_only
             predictions.append({
                 "tourney_date": row.tourney_date, "tour": tour, "surface": row.surface,
                 "tourney_level": row.tourney_level, "round": row.round,
                 "winner_id": row.winner_id, "loser_id": row.loser_id,
                 "winner_rank": row.winner_rank, "loser_rank": row.loser_rank,
                 "prob_winner": prob_winner,
+                "prob_winner_general_only": prob_general_only,
             })
             # edad conocida más reciente
             players[row.winner_id].last_known_age = row.winner_age
